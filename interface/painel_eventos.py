@@ -1,12 +1,13 @@
 # interface/painel_eventos.py
 # Painel do Modo Aula — três níveis de explicação (Simples, Técnico, Pacote Bruto).
-# O nível Pacote Bruto é exclusivo para HTTP e mostra o tráfego exatamente como capturado.
+# O nivel Pacote Bruto e exclusivo para HTTP e mostra o trafego exatamente como capturado.
 
 from collections import defaultdict
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QScrollArea, QFrame, QPushButton, QTextEdit,
     QSplitter, QTabWidget, QLineEdit, QComboBox,
+    QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt6.QtCore import Qt, pyqtSlot
 from PyQt6.QtGui import QFont
@@ -113,7 +114,11 @@ class PainelContadores(QWidget):
         titulo.setStyleSheet("color:#7f8c8d;font-size:9px;")
         layout.addWidget(titulo)
 
+        tipos_vistos = set()
         for tipo, icone, cor in self.TIPOS_MONITORADOS:
+            if tipo in tipos_vistos:
+                continue  # evita duplicar rótulos
+            tipos_vistos.add(tipo)
             lbl = QLabel(f"{icone} {tipo}: 0")
             lbl.setStyleSheet(
                 f"color:{cor};font-size:9px;font-family:Consolas;"
@@ -176,15 +181,11 @@ class PainelEventos(QWidget):
         cab = QHBoxLayout()
         fonte_titulo = QFont("Arial", 12)
         fonte_titulo.setBold(True)
-        titulo = QLabel("  Modo Análise — Eventos de Rede em Tempo Real")
+        titulo = QLabel("  Modo Analise - Eventos de Rede em Tempo Real")
         titulo.setFont(fonte_titulo)
         cab.addWidget(titulo)
         cab.addStretch()
 
-        btn_limpar = QPushButton("🗑  Limpar sessão")
-        btn_limpar.setMaximumWidth(130)
-        btn_limpar.clicked.connect(self.limpar)
-        cab.addWidget(btn_limpar)
         layout.addLayout(cab)
 
         sep = QFrame()
@@ -205,7 +206,7 @@ class PainelEventos(QWidget):
         layout.addWidget(self.abas)
 
         self.abas.addTab(self._criar_aba_eventos(), "Eventos ao Vivo")
-        
+        self.abas.addTab(self._criar_aba_insights(), "Insights")
 
         # Rodapé
         self.lbl_rodape = QLabel("Nenhum evento registrado.")
@@ -217,6 +218,32 @@ class PainelEventos(QWidget):
         # Estado inicial
         self._trocar_nivel(0)
         self._exibir_boas_vindas()
+
+    def atualizar_insights(self, top_dns: list, historias: list):
+        """Atualiza tabela de dominios e historias de navegacao."""
+        if hasattr(self, "tabela_dns"):
+            self.tabela_dns.setRowCount(len(top_dns))
+            for i, dom in enumerate(top_dns):
+                self.tabela_dns.setItem(i, 0, QTableWidgetItem(dom.get("dominio", "")))
+                self.tabela_dns.setItem(i, 1, QTableWidgetItem(str(dom.get("acessos", 0))))
+                kb = dom.get("bytes", 0) / 1024
+                self.tabela_dns.setItem(i, 2, QTableWidgetItem(f"{kb:.1f}"))
+        if hasattr(self, "lista_hist"):
+            texto = "\n".join(f"• {h}" for h in historias) if historias else "Nenhuma historia gerada ainda."
+            self.lista_hist.setPlainText(texto)
+
+    # Utilitario interno para criar tabelas pequenas
+    def _criar_tabela(self, cabecalhos: list, altura: int = None) -> QTableWidget:
+        t = QTableWidget(0, len(cabecalhos))
+        t.setHorizontalHeaderLabels(cabecalhos)
+        t.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        t.verticalHeader().setVisible(False)
+        t.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        t.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        t.setAlternatingRowColors(True)
+        if altura:
+            t.setMaximumHeight(altura)
+        return t
 
     def _criar_barra_filtros(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -239,15 +266,11 @@ class PainelEventos(QWidget):
         row.addWidget(self.combo_protocolo)
 
         self.campo_busca = QLineEdit()
-        self.campo_busca.setPlaceholderText("Buscar por IP, domínio, palavra-chave…")
+        self.campo_busca.setPlaceholderText("Buscar por IP, dominio ou palavra-chave")
         self.campo_busca.setMaximumWidth(280)
         self.campo_busca.textChanged.connect(self._ao_mudar_filtro_texto)
         row.addWidget(self.campo_busca)
 
-        btn_limpar_filtro = QPushButton("✕ Limpar filtro")
-        btn_limpar_filtro.setMaximumWidth(110)
-        btn_limpar_filtro.clicked.connect(self._limpar_filtros)
-        row.addWidget(btn_limpar_filtro)
 
         row.addStretch()
         return row
@@ -337,12 +360,47 @@ class PainelEventos(QWidget):
 
         return widget
 
+    def _criar_aba_insights(self) -> QWidget:
+        """Aba didatica com resumo por dominio (DNS/SNI) e historias agregadas."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(6)
+
+        lbl_top = QLabel("Top dominios (DNS/SNI)")
+        lbl_top.setStyleSheet("color:#bdc3c7;font-weight:bold;")
+        layout.addWidget(lbl_top)
+
+        self.tabela_dns = self._criar_tabela(["Dominio", "Acessos", "Dados (KB)"], altura=180)
+        layout.addWidget(self.tabela_dns)
+
+        lbl_hist = QLabel("Historias de navegacao")
+        lbl_hist.setStyleSheet("color:#bdc3c7;font-weight:bold; margin-top:4px;")
+        layout.addWidget(lbl_hist)
+
+        self.lista_hist = QTextEdit()
+        self.lista_hist.setReadOnly(True)
+        self.lista_hist.setPlaceholderText("Narrativas: quem acessou qual dominio e quando. Baseado em DNS/SNI.")
+        layout.addWidget(self.lista_hist, 1)
+
+        return widget
+
     # ──────────────────────────────────────────────
     # Interface pública
     # ──────────────────────────────────────────────
 
     def adicionar_evento(self, dados: dict):
         """Recebe um evento do motor pedagógico e exibe na interface."""
+        def _fix_mojibake(txt: str) -> str:
+            if not isinstance(txt, str):
+                return txt
+            for enc in ("cp1252", "latin1"):
+                try:
+                    return txt.encode(enc, errors="ignore").decode("utf-8")
+                except Exception:
+                    continue
+            return txt
+
         if len(self._todos_eventos) >= self.LIMITE_EVENTOS:
             self._todos_eventos.pop(0)
 
@@ -350,6 +408,9 @@ class PainelEventos(QWidget):
         tipo   = dados.get("tipo", "")
         self._contagem_sessao[sessao][tipo] += 1
         dados["contador_sessao"] = self._contagem_sessao[sessao][tipo]
+        for k in ("titulo", "nivel1", "nivel2", "nivel3", "nivel4", "alerta_seguranca", "fluxo_visual"):
+            if k in dados:
+                dados[k] = _fix_mojibake(dados[k])
 
         self._todos_eventos.append(dados)
         self.painel_contadores.incrementar(dados.get("tipo", ""))
@@ -606,7 +667,6 @@ class PainelEventos(QWidget):
           </p>
         </div>
         """)
-
 
 
 

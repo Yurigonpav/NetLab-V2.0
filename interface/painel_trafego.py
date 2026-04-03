@@ -205,7 +205,9 @@ class PainelTrafego(QWidget):
 
     def atualizar_tabelas(self, estatisticas_protocolos: list,
                            top_dispositivos: list,
-                           total_pacotes: int, total_bytes: int):
+                           total_pacotes: int, total_bytes: int,
+                           total_topologia: int = None,
+                           total_ativos: int = None):
         """Atualiza cards e tabelas com os dados mais recentes do analisador."""
 
         # Cards
@@ -214,7 +216,9 @@ class PainelTrafego(QWidget):
         self.card_dados.definir_valor(
             f"{kb/1024:.2f} MB" if kb > 1024 else f"{kb:.1f} KB"
         )
-        self.card_dispositivos.definir_valor(str(len(top_dispositivos)))
+
+        ativos = total_ativos if total_ativos is not None else len(top_dispositivos)
+        self.card_dispositivos.definir_valor(str(ativos))
 
         # Velocidade atual = último ponto do histórico
         vel = list(self._historico_kb)[-1] if self._historico_kb else 0.0

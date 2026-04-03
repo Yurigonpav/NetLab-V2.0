@@ -212,6 +212,7 @@ class VisualizadorTopologia(QWidget):
         self.contagem_conexoes: Dict[Tuple, int]  = defaultdict(int)
         self._posicoes_mundo: Dict[str, QPointF]  = {}
         self._ip_local = self._obter_ip_local()
+        self._rede_local = None  # ipaddress.ip_network
 
         self._zoom       = 1.0
         self._offset     = QPointF(0, 0)
@@ -237,7 +238,7 @@ class VisualizadorTopologia(QWidget):
     def registrar_origem(self, ip: str, mac: str = "", hostname: str = ""):
         if not _eh_endereco_valido(ip):
             return
-        chave = ip if _eh_ip_local(ip) else "internet"
+        chave = ip if self._pertence_rede(ip) else "internet"
 
         if chave not in self.dispositivos:
             self.dispositivos[chave] = {
@@ -260,8 +261,8 @@ class VisualizadorTopologia(QWidget):
                           porta_origem: int = 0, porta_destino: int = 0):
         if not _eh_endereco_valido(ip_origem) or not _eh_endereco_valido(ip_destino):
             return
-        no_a = ip_origem  if _eh_ip_local(ip_origem)  else "internet"
-        no_b = ip_destino if _eh_ip_local(ip_destino) else "internet"
+        no_a = ip_origem  if self._pertence_rede(ip_origem)  else "internet"
+        no_b = ip_destino if self._pertence_rede(ip_destino) else "internet"
         if no_a == no_b:
             return
         if no_a not in self.dispositivos and no_b not in self.dispositivos:
@@ -338,6 +339,25 @@ class VisualizadorTopologia(QWidget):
         self._offset = QPointF(0, 0)
         self._auto_zoom()
         self.update()
+
+    def definir_rede_local(self, cidr: str):
+        """Define a rede local (CIDR) para filtrar nós fora da LAN."""
+        try:
+            import ipaddress
+            self._rede_local = ipaddress.ip_network(cidr, strict=False) if cidr else None
+        except Exception:
+            self._rede_local = None
+
+    def _pertence_rede(self, ip: str) -> bool:
+        if not ip or not _eh_endereco_valido(ip):
+            return False
+        if self._rede_local is None:
+            return _eh_ip_local(ip)
+        try:
+            import ipaddress
+            return ipaddress.ip_address(ip) in self._rede_local
+        except Exception:
+            return _eh_ip_local(ip)
 
     # ── Desenho ────────────────────────────────────────────────────────────
 
@@ -799,6 +819,22 @@ class PainelTopologia(QWidget):
     def atualizar(self):
         self.visualizador.update()
 
+    def definir_rede_local(self, cidr: str):
+        """Define rede local para filtrar o que é exibido na topologia."""
+        self.visualizador.definir_rede_local(cidr)
+
     def limpar(self):
         self._painel_detalhes.hide()
         self.visualizador.limpar()
+
+    def total_dispositivos(self) -> int:
+        """Retorna total de nÃ³s renderizados (ativos + descobertos)."""
+        return len([ip for ip in self.visualizador.dispositivos if ip != "internet"])
+
+    def total_dispositivos_ativos(self) -> int:
+        """Conta apenas nÃ³s que jÃ¡ trafegaram pacotes."""
+        return sum(
+            1
+            for ip, d in self.visualizador.dispositivos.items()
+            if ip != "internet" and d.get("pacotes", 0) > 0
+        )

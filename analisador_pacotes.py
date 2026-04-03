@@ -12,6 +12,23 @@ class AnalisadorPacotes:
         self.estatisticas_protocolos = defaultdict(int)    # protocolo -> contagem de pacotes
         self.bytes_por_protocolo = defaultdict(int)       # protocolo -> bytes acumulados
         self.trafego_dispositivos = defaultdict(lambda: {"enviado": 0, "recebido": 0})
+        self._top_dns = defaultdict(lambda: {"contagem": 0, "bytes": 0})
+
+    @staticmethod
+    def _eh_local(ip: str) -> bool:
+        try:
+            p = [int(x) for x in ip.split(".")]
+            if len(p) != 4:
+                return False
+            if p[0] == 10:
+                return True
+            if p[0] == 172 and 16 <= p[1] <= 31:
+                return True
+            if p[0] == 192 and p[1] == 168:
+                return True
+        except Exception:
+            return False
+        return False
 
     def processar_pacote(self, dados: dict):
         """Retorna um dicionário de evento se o pacote for relevante, ou None."""
@@ -19,9 +36,9 @@ class AnalisadorPacotes:
         tamanho = dados.get("tamanho", 0)
         self.total_bytes += tamanho
 
-        proto = dados.get("protocolo", "Outro")
-        self.estatisticas_protocolos[proto] += 1
-        self.bytes_por_protocolo[proto] += tamanho
+        # Protocolo base informado pela captura (pode ser reclassificado para HTTP/HTTPS)
+        proto = dados.get("protocolo", "Outro") or "Outro"
+        protocolo_contagem = proto
 
         ip_origem = dados.get("ip_origem")
         ip_destino = dados.get("ip_destino")
@@ -42,6 +59,8 @@ class AnalisadorPacotes:
                 "dominio": dados["dominio"],
                 "protocolo": "DNS"
             }
+            self._top_dns[dados["dominio"]]["contagem"] += 1
+            self._top_dns[dados["dominio"]]["bytes"] += tamanho
 
         # 2) TCP SYN (nova conexão)
         elif proto == "TCP" and dados.get("flags") == "SYN":
@@ -63,6 +82,7 @@ class AnalisadorPacotes:
                     primeira_linha = linhas[0].decode('utf-8', errors='ignore')
                     if re.match(r"(GET|POST|PUT|DELETE|HEAD|OPTIONS)", primeira_linha):
                         partes = primeira_linha.split(' ')
+                        protocolo_contagem = "HTTP"
                         metodo = partes[0] if len(partes) > 0 else "HTTP"
                         recurso = partes[1] if len(partes) > 1 else "/"
                         corpo = b""
@@ -89,6 +109,7 @@ class AnalisadorPacotes:
 
         # 4) HTTPS (porta 443)
         elif dados.get("porta_destino") == 443 or dados.get("porta_origem") == 443:
+            protocolo_contagem = "HTTPS"
             evento = {
                 "tipo": "HTTPS",
                 "ip_origem": ip_origem,
@@ -115,6 +136,10 @@ class AnalisadorPacotes:
                 "protocolo": "ARP"
             }
 
+        # Atualiza os contadores com o protocolo efetivo detectado
+        self.estatisticas_protocolos[protocolo_contagem] += 1
+        self.bytes_por_protocolo[protocolo_contagem] += tamanho
+
         return evento
 
     def obter_estatisticas_protocolos(self):
@@ -130,9 +155,14 @@ class AnalisadorPacotes:
         return resultado
 
     def obter_top_dispositivos(self, top_n=10):
-        """Retorna lista de dicionários: [{'ip': ip, 'enviado': bytes, 'recebido': bytes, 'total': bytes}, ...]"""
+        """Retorna lista agregando IPs externos em 'internet', consistente com a topologia."""
+        agregado = defaultdict(lambda: {"enviado": 0, "recebido": 0})
+        for ip, stats in self.trafego_dispositivos.items():
+            chave = ip if self._eh_local(ip) else "internet"
+            agregado[chave]["enviado"]  += stats["enviado"]
+            agregado[chave]["recebido"] += stats["recebido"]
         ordenados = sorted(
-            self.trafego_dispositivos.items(),
+            agregado.items(),
             key=lambda x: x[1]["enviado"] + x[1]["recebido"],
             reverse=True
         )
@@ -145,3 +175,14 @@ class AnalisadorPacotes:
                 "total": stats["enviado"] + stats["recebido"]
             })
         return resultado
+
+    def obter_top_dns(self, top_n=10):
+        ordenados = sorted(
+            self._top_dns.items(),
+            key=lambda x: x[1]["contagem"],
+            reverse=True
+        )
+        return [
+            {"dominio": dom, "acessos": info["contagem"], "bytes": info["bytes"]}
+            for dom, info in ordenados[:top_n]
+        ]
