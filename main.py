@@ -62,5 +62,3 @@ def iniciar_aplicacao():
 
 if __name__ == "__main__":
     iniciar_aplicacao()
-
-

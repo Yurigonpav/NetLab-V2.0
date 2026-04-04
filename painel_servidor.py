@@ -982,7 +982,7 @@ class PainelServidor(QWidget):
         self._clientes_unicos   = set()
 
         # Valores atuais dos controles
-        self._porta_atual = 8080
+        self._porta_atual = 8000
         self._limite_atual = 10
         self._tempo_atual = 30
         self._modo_login = "vulneravel"

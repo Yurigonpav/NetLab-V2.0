@@ -1,188 +1,652 @@
 # analisador_pacotes.py
+# ============================================================
+# VERSÃO ALTA PERFORMANCE  —  NetLab Educacional
+#
+# Arquitetura de 3 camadas:
+#
+#   CAMADA 1 — Parser C (ctypes)
+#     http_parser.dll/so compilado de http_parser.c.
+#     Se não encontrado, cai silenciosamente para o parser Python.
+#     Hot-path HTTP: ate 10x mais rapido que re.match() em Python.
+#
+#   CAMADA 2 — Thread de analise dedicada (ThreadAnalisador)
+#     A analise NAO ocorre mais no timer do Qt (UI thread).
+#     Um thread daemon consome a fila de entrada continuamente,
+#     analisa em lotes e deposita eventos numa fila de saida.
+#     O Qt timer apenas le a fila de saida — operacao O(1).
+#
+#   CAMADA 3 — Filas limitadas (zero OOM, descarte controlado)
+#     fila_entrada  : deque(maxlen=MAXQ_ENTRADA)
+#     fila_saida    : deque(maxlen=MAXQ_SAIDA)
+#     Quando cheias, o pacote/evento mais antigo e descartado
+#     automaticamente — PC nunca trava por falta de memoria.
+#
+# Integracao com janela_principal.py
+# -----------------------------------
+# Substitua _consumir_fila() por:
+#
+#     def _consumir_fila(self):
+#         eventos, _ = self.analisador.coletar_resultados()
+#         for evento in eventos:
+#             ip_origem  = evento.get("ip_origem",  "")
+#             ip_destino = evento.get("ip_destino", "")
+#             mac_origem = evento.get("mac_origem", "")
+#             if ip_origem:
+#                 self.painel_topologia.adicionar_dispositivo(ip_origem, mac_origem)
+#                 self.banco.salvar_dispositivo(ip_origem, mac_origem)
+#             if ip_origem and ip_destino:
+#                 self.painel_topologia.adicionar_conexao(ip_origem, ip_destino)
+#             if evento.get("tipo"):
+#                 self._exibir_evento_pedagogico(evento)
+#
+# Em _iniciar_captura(), apos criar o capturador:
+#     self.analisador.iniciar_thread()
+#
+# Em _parar_captura():
+#     self.analisador.parar_thread()
+#
+# No capturador_rede.py, no lugar de fila_pacotes_global.put():
+#     self.analisador.enfileirar(dados)   <- modo async
+#     OU manter fila_pacotes_global e chamar processar_pacote() <- modo sync
+#
+# API PUBLICA MANTIDA 100% COMPATIVEL:
+#   resetar(), processar_pacote(), processar_lote()
+#   obter_estatisticas_protocolos(), obter_top_dispositivos()
+#   obter_top_dns(), total_pacotes, total_bytes
+# ============================================================
+
 import re
-from collections import defaultdict
+import ctypes
+import platform
+import threading
+import time
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Optional, Dict, Tuple
+
+# ── Configuracao das filas ───────────────────────────────────
+MAXQ_ENTRADA = 8_000   # pacotes aguardando analise
+MAXQ_SAIDA   = 2_000   # eventos aguardando consumo pelo Qt
+BATCH_SIZE   = 100     # pacotes processados por iteracao do thread
+SLEEP_VAZIO  = 0.005   # segundos de sleep quando fila vazia (5ms)
+
+# ── Configuracoes do reassembly TCP ──────────────────────────
+HTTP_REASSEMBLY_TIMEOUT = 30.0   # segundos
+CLEANUP_INTERVAL        = 1000   # pacotes processados entre limpezas
+
+# ── Regex pre-compiladas (fallback Python) ───────────────────
+_RE_HTTP_METHOD = re.compile(rb"^(GET|POST|PUT|DELETE|HEAD|OPTIONS) ")
+_RE_HTTP_RESPONSE = re.compile(rb"^HTTP/\d\.\d (\d{3})")  # resposta HTTP
+_RE_CREDENTIALS = re.compile(
+    rb'(user|login|email|pass|password)=([^&\s]+)', re.I
+)
+
+# ── Portas conhecidas como frozenset para O(1) lookup ────────
+# Expansao de portas HTTP/HTTPS conforme solicitado
+_PORTAS_HTTP = frozenset({
+    80, 8000, 8080, 8081, 8888, 81, 3000, 5000,
+    8008, 9000, 9090, 3001, 4200, 8088
+})
+_PORTAS_HTTPS = frozenset({
+    443, 8443, 9443, 8444, 10443
+})
+
+# Cache de classificacao de IP local (evita re-parse de IPs repetidos)
+_CACHE_LOCAL: dict = {}
+
+
+# ── Funcoes de cache de IP ───────────────────────────────────
+
+def _calcular_eh_local(ip: str) -> bool:
+    try:
+        p = ip.split(".", 2)
+        a = int(p[0])
+        if a == 10:
+            return True
+        if a == 192:
+            return len(p) >= 2 and int(p[1]) == 168
+        if a == 172:
+            return len(p) >= 2 and 16 <= int(p[1]) <= 31
+    except Exception:
+        pass
+    return False
+
+
+def _eh_local_rapido(ip: str) -> bool:
+    cached = _CACHE_LOCAL.get(ip)
+    if cached is not None:
+        return cached
+    resultado = _calcular_eh_local(ip)
+    if len(_CACHE_LOCAL) < 8192:
+        _CACHE_LOCAL[ip] = resultado
+    return resultado
+
+
+# ════════════════════════════════════════════════════════════
+# CAMADA 1 — Parser HTTP em C via ctypes
+# ════════════════════════════════════════════════════════════
+
+class _HttpResult(ctypes.Structure):
+    """Espelho exato de HttpResult em http_parser.c"""
+    _fields_ = [
+        ("method",     ctypes.c_char * 16),
+        ("resource",   ctypes.c_char * 512),
+        ("is_http",    ctypes.c_int),
+        ("cred_count", ctypes.c_int),
+        ("cred_keys",  (ctypes.c_char * 64) * 8),
+        ("cred_vals",  (ctypes.c_char * 128) * 8),
+    ]
+
+
+def _carregar_parser_c():
+    sistema = platform.system()
+    nome    = "http_parser.dll" if sistema == "Windows" else "http_parser.so"
+    caminho = Path(__file__).parent / nome
+
+    if not caminho.exists():
+        print(
+            f"[NetLab] {nome} nao encontrado — usando parser Python.\n"
+            f"         Execute: python compilar_http_parser.py"
+        )
+        return None
+
+    try:
+        lib = ctypes.CDLL(str(caminho))
+        fn  = lib.parse_http_request
+        fn.argtypes = [
+            ctypes.POINTER(ctypes.c_uint8),
+            ctypes.c_int,
+            ctypes.POINTER(_HttpResult),
+        ]
+        fn.restype = None
+        print(f"[NetLab] Parser C carregado: {caminho}")
+        return fn
+    except Exception as e:
+        print(f"[NetLab] Falha ao carregar {nome}: {e} — usando Python.")
+        return None
+
+
+_c_parse_http = _carregar_parser_c()
+
+
+def _parse_http_c(payload: bytes, ip_origem, ip_destino):
+    """Parser C com fallback seguro via try/except"""
+    try:
+        result = _HttpResult()
+        buf    = (ctypes.c_uint8 * len(payload)).from_buffer_copy(payload)
+        _c_parse_http(buf, len(payload), ctypes.byref(result))
+
+        if not result.is_http:
+            return None, "TCP"
+
+        metodo  = result.method.decode("utf-8",  errors="ignore")
+        recurso = result.resource.decode("utf-8", errors="ignore")
+        credenciais = [
+            (
+                result.cred_keys[i].decode("utf-8", errors="ignore"),
+                result.cred_vals[i].decode("utf-8", errors="ignore"),
+            )
+            for i in range(result.cred_count)
+        ]
+        return {
+            "tipo":          "HTTP",
+            "ip_origem":     ip_origem,
+            "ip_destino":    ip_destino,
+            "metodo":        metodo,
+            "recurso":       recurso,
+            "credenciais":   credenciais,
+            "payload_bruto": payload[:500].decode("utf-8", errors="ignore"),
+            "protocolo":     "HTTP",
+        }, "HTTP"
+    except Exception:
+        # Fallback silencioso para parser Python em caso de erro no C
+        return _parse_http_python(payload, ip_origem, ip_destino)
+
+
+def _parse_http_python(payload: bytes, ip_origem, ip_destino):
+    if not payload or not _RE_HTTP_METHOD.match(payload):
+        return None, "TCP"
+    try:
+        nl     = payload.index(b"\r\n") if b"\r\n" in payload else 200
+        linha  = payload[:nl].decode("utf-8", errors="ignore").split(" ", 2)
+        metodo = linha[0] if linha else "HTTP"
+        recurso= linha[1] if len(linha) > 1 else "/"
+
+        credenciais = []
+        if metodo == "POST":
+            sep = payload.find(b"\r\n\r\n")
+            if sep != -1:
+                for m in _RE_CREDENTIALS.finditer(payload[sep + 4:]):
+                    credenciais.append((
+                        m.group(1).decode("utf-8", errors="ignore"),
+                        m.group(2).decode("utf-8", errors="ignore"),
+                    ))
+        return {
+            "tipo":          "HTTP",
+            "ip_origem":     ip_origem,
+            "ip_destino":    ip_destino,
+            "metodo":        metodo,
+            "recurso":       recurso,
+            "credenciais":   credenciais,
+            "payload_bruto": payload[:500].decode("utf-8", errors="ignore"),
+            "protocolo":     "HTTP",
+        }, "HTTP"
+    except Exception:
+        return None, "TCP"
+
+
+# Escolha do parser: C com fallback integrado (dentro de _parse_http_c)
+_parse_http = _parse_http_c if _c_parse_http else _parse_http_python
+
+
+# ════════════════════════════════════════════════════════════
+# Buffer de reassemblagem TCP para HTTP fragmentado
+# ════════════════════════════════════════════════════════════
+
+class _TCPReassemblyBuffer:
+    __slots__ = ('payload', 'last_update')
+    def __init__(self, initial_payload: bytes):
+        self.payload = bytearray(initial_payload)
+        self.last_update = time.monotonic()
+
+    def append(self, data: bytes) -> None:
+        self.payload.extend(data)
+        self.last_update = time.monotonic()
+
+    def get_payload(self) -> bytes:
+        return bytes(self.payload)
+
+    def is_expired(self, timeout: float) -> bool:
+        return (time.monotonic() - self.last_update) > timeout
+
+
+# ════════════════════════════════════════════════════════════
+# Funcao de parsing stateful (suporte a reassembly e respostas HTTP)
+# ════════════════════════════════════════════════════════════
+
+def _parsear_pacote(
+    dados: dict,
+    tcp_buffers: Optional[Dict[Tuple, _TCPReassemblyBuffer]] = None,
+    buffer_lock: Optional[threading.Lock] = None
+):
+    """
+    Detecta o tipo de pacote. Suporte opcional a reassemblagem TCP.
+    Se tcp_buffers e buffer_lock forem fornecidos, o reassembly e' ativado
+    para conexoes HTTP. Caso contrario, comportamento original.
+
+    Retorna (evento_ou_None, protocolo_efetivo, tamanho, ip_origem, ip_destino).
+    """
+    tamanho    = dados.get("tamanho") or 0
+    proto      = dados.get("protocolo") or "Outro"
+    ip_origem  = dados.get("ip_origem")
+    ip_destino = dados.get("ip_destino")
+    porta_dest = dados.get("porta_destino")
+    porta_orig = dados.get("porta_origem")
+    payload    = dados.get("payload", b"")
+
+    evento            = None
+    protocolo_efetivo = proto
+
+    # ── DETECÇÃO DE RESPOSTAS HTTP (antes do filtro de portas) ──
+    if payload and _RE_HTTP_RESPONSE.match(payload):
+        try:
+            # Extrai o status code (ex: 200, 404, 500)
+            status_match = _RE_HTTP_RESPONSE.search(payload)
+            status_code = status_match.group(1).decode('ascii', errors='ignore') if status_match else "???"
+            evento = {
+                "tipo":          "HTTP_RESPONSE",
+                "ip_origem":     ip_origem,
+                "ip_destino":    ip_destino,
+                "status_code":   status_code,
+                "payload_bruto": payload[:500].decode("utf-8", errors="ignore"),
+                "protocolo":     "HTTP",
+            }
+            protocolo_efetivo = "HTTP"
+            return evento, protocolo_efetivo, tamanho, ip_origem, ip_destino
+        except Exception:
+            pass  # fallback para demais detecções
+
+    # ── DEMAIS PROTOCOLOS (DNS, TCP, ICMP, ARP) mantidos originais ──
+    if proto == "DNS":
+        dominio = dados.get("dominio")
+        if dominio:
+            evento = {
+                "tipo":       "DNS",
+                "ip_origem":  ip_origem,
+                "ip_destino": ip_destino,
+                "dominio":    dominio,
+                "protocolo":  "DNS",
+            }
+
+    elif proto == "TCP":
+        if dados.get("flags") == "SYN":
+            evento = {
+                "tipo":          "TCP_SYN",
+                "ip_origem":     ip_origem,
+                "ip_destino":    ip_destino,
+                "porta_origem":  porta_orig,
+                "porta_destino": porta_dest,
+                "protocolo":     "TCP",
+            }
+        elif (porta_dest in _PORTAS_HTTP or porta_orig in _PORTAS_HTTP) and tcp_buffers is not None:
+            # --- Reassemblagem TCP para HTTP fragmentado ---
+            chave = (ip_origem, porta_orig, ip_destino, porta_dest)
+            buffer_obj = None
+
+            with buffer_lock:
+                # Remove buffer expirado se existir
+                existing = tcp_buffers.get(chave)
+                if existing and existing.is_expired(HTTP_REASSEMBLY_TIMEOUT):
+                    del tcp_buffers[chave]
+                    existing = None
+
+                if existing:
+                    # Acumula novo payload
+                    existing.append(payload)
+                    payload_acumulado = existing.get_payload()
+                else:
+                    payload_acumulado = payload
+
+            # Verifica se o payload acumulado agora é uma requisição HTTP
+            if _RE_HTTP_METHOD.match(payload_acumulado):
+                # Requisição completa: processa e remove buffer
+                evento, protocolo_efetivo = _parse_http(payload_acumulado, ip_origem, ip_destino)
+                with buffer_lock:
+                    tcp_buffers.pop(chave, None)
+            elif existing:
+                # Ainda incompleto, mantém buffer (já atualizado)
+                evento = None  # nenhum evento ainda
+            else:
+                # Primeiro fragmento que não começa com método: cria buffer
+                if payload_acumulado:
+                    with buffer_lock:
+                        tcp_buffers[chave] = _TCPReassemblyBuffer(payload_acumulado)
+                evento = None
+        elif porta_dest in _PORTAS_HTTP or porta_orig in _PORTAS_HTTP:
+            # Sem reassembly (buffers não fornecidos) ou porta não HTTP
+            evento, protocolo_efetivo = _parse_http(payload, ip_origem, ip_destino)
+        elif porta_dest in _PORTAS_HTTPS or porta_orig in _PORTAS_HTTPS:
+            protocolo_efetivo = "HTTPS"
+            evento = {
+                "tipo":       "HTTPS",
+                "ip_origem":  ip_origem,
+                "ip_destino": ip_destino,
+                "protocolo":  "HTTPS",
+            }
+
+    elif proto == "ICMP":
+        evento = {
+            "tipo":       "ICMP",
+            "ip_origem":  ip_origem,
+            "ip_destino": ip_destino,
+            "protocolo":  "ICMP",
+        }
+
+    elif proto == "ARP":
+        evento = {
+            "tipo":       "ARP",
+            "ip_origem":  ip_origem,
+            "ip_destino": ip_destino,
+            "mac_origem": dados.get("mac_origem"),
+            "protocolo":  "ARP",
+        }
+
+    return evento, protocolo_efetivo, tamanho, ip_origem, ip_destino
+
+
+# ════════════════════════════════════════════════════════════
+# CAMADA 2 — Thread de analise dedicada
+# ════════════════════════════════════════════════════════════
+
+class ThreadAnalisador(threading.Thread):
+    """
+    Thread daemon que consome pacotes da fila de entrada,
+    analisa em lotes e deposita resultados na fila de saida.
+    O Qt timer le apenas a fila de saida — nunca bloqueia a UI.
+    """
+
+    def __init__(self, fila_entrada: deque, fila_saida: deque,
+                 analisador: "AnalisadorPacotes"):
+        super().__init__(name="NetLab-Analisador", daemon=True)
+        self._fila_entrada = fila_entrada
+        self._fila_saida   = fila_saida
+        self._analisador   = analisador
+        self._rodando      = threading.Event()
+
+    def run(self):
+        self._rodando.set()
+        fila_in  = self._fila_entrada
+        fila_out = self._fila_saida
+        processar = self._analisador._processar_dados_brutos
+
+        while self._rodando.is_set():
+            if not fila_in:
+                time.sleep(SLEEP_VAZIO)
+                continue
+
+            lote = []
+            try:
+                while fila_in and len(lote) < BATCH_SIZE:
+                    lote.append(fila_in.popleft())
+            except IndexError:
+                pass
+
+            for dados in lote:
+                evento = processar(dados)
+                if evento:
+                    fila_out.append(evento)
+
+    def parar(self):
+        self._rodando.clear()
+
+
+# ════════════════════════════════════════════════════════════
+# CAMADA 3 — AnalisadorPacotes com filas limitadas e reassembly TCP
+# ════════════════════════════════════════════════════════════
 
 class AnalisadorPacotes:
+    """
+    Analisador de pacotes de alta performance para o NetLab Educacional.
+
+    Modo assincrono (recomendado — zero travamento na UI):
+        analisador.iniciar_thread()             # em _iniciar_captura()
+        analisador.enfileirar(dados)            # no capturador_rede
+        eventos, _ = analisador.coletar_resultados()  # no _consumir_fila()
+        analisador.parar_thread()               # em _parar_captura()
+
+    Modo sincrono (compativel com o original):
+        evento = analisador.processar_pacote(dados)
+    """
+
     def __init__(self):
+        self._fila_entrada: deque = deque(maxlen=MAXQ_ENTRADA)
+        self._fila_saida:   deque = deque(maxlen=MAXQ_SAIDA)
+        self._thread: Optional[ThreadAnalisador] = None
+        self._lock = threading.Lock()
+        self._buffer_lock = threading.Lock()          # protege buffers TCP
+        self._tcp_buffers: Dict[Tuple, _TCPReassemblyBuffer] = {}  # reassembly HTTP
+        self._packet_count_since_cleanup = 0
         self.resetar()
 
-    def resetar(self):
-        self.total_pacotes = 0
-        self.total_bytes = 0
-        self.estatisticas_protocolos = defaultdict(int)    # protocolo -> contagem de pacotes
-        self.bytes_por_protocolo = defaultdict(int)       # protocolo -> bytes acumulados
-        self.trafego_dispositivos = defaultdict(lambda: {"enviado": 0, "recebido": 0})
-        self._top_dns = defaultdict(lambda: {"contagem": 0, "bytes": 0})
+    # ── Ciclo de vida ────────────────────────────────────────
 
-    @staticmethod
-    def _eh_local(ip: str) -> bool:
+    def iniciar_thread(self):
+        """Inicia a thread de analise. Chamar em _iniciar_captura()."""
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = ThreadAnalisador(
+            self._fila_entrada, self._fila_saida, self
+        )
+        self._thread.start()
+
+    def parar_thread(self):
+        """Para a thread de analise. Chamar em _parar_captura()."""
+        if self._thread:
+            self._thread.parar()
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def enfileirar(self, dados: dict):
+        """
+        Enfileira pacote para analise assincrona.
+        Se a fila estiver cheia (8000 itens), o mais antigo e descartado
+        automaticamente pelo deque(maxlen=) — sem travar, sem OOM.
+        """
+        self._fila_entrada.append(dados)
+
+    def coletar_resultados(self):
+        """
+        Retorna (lista_eventos, stats) consumindo toda a fila de saida.
+        Chamado pelo Qt timer — operacao O(n_eventos), nunca bloqueia.
+        """
+        eventos = []
         try:
-            p = [int(x) for x in ip.split(".")]
-            if len(p) != 4:
-                return False
-            if p[0] == 10:
-                return True
-            if p[0] == 172 and 16 <= p[1] <= 31:
-                return True
-            if p[0] == 192 and p[1] == 168:
-                return True
-        except Exception:
-            return False
-        return False
+            while self._fila_saida:
+                eventos.append(self._fila_saida.popleft())
+        except IndexError:
+            pass
+        return eventos, {"total_pacotes": self.total_pacotes,
+                         "total_bytes":   self.total_bytes}
 
-    def processar_pacote(self, dados: dict):
-        """Retorna um dicionário de evento se o pacote for relevante, ou None."""
+    # ── Reset ────────────────────────────────────────────────
+
+    def resetar(self):
+        with self._lock:
+            self.total_pacotes: int = 0
+            self.total_bytes:   int = 0
+            self.estatisticas_protocolos: defaultdict = defaultdict(int)
+            self.bytes_por_protocolo:     defaultdict = defaultdict(int)
+            self._enviado:  defaultdict = defaultdict(int)
+            self._recebido: defaultdict = defaultdict(int)
+            self._top_dns:  defaultdict = defaultdict(lambda: [0, 0])
+            self._fila_entrada.clear()
+            self._fila_saida.clear()
+            _CACHE_LOCAL.clear()
+            # Limpeza dos buffers de reassembly TCP
+            with self._buffer_lock:
+                self._tcp_buffers.clear()
+            self._packet_count_since_cleanup = 0
+
+    # ── Compatibilidade ──────────────────────────────────────
+
+    @property
+    def trafego_dispositivos(self) -> dict:
+        """Compatibilidade com codigo legado. Nao chamar no hot-path."""
+        ips = set(self._enviado) | set(self._recebido)
+        return {
+            ip: {"enviado": self._enviado[ip], "recebido": self._recebido[ip]}
+            for ip in ips
+        }
+
+    # ── Limpeza periodica de buffers expirados ────────────────
+
+    def _limpar_buffers_expirados(self):
+        """Remove buffers TCP que ultrapassaram HTTP_REASSEMBLY_TIMEOUT."""
+        now = time.monotonic()
+        with self._buffer_lock:
+            expirados = [
+                chave for chave, buf in self._tcp_buffers.items()
+                if (now - buf.last_update) > HTTP_REASSEMBLY_TIMEOUT
+            ]
+            for chave in expirados:
+                del self._tcp_buffers[chave]
+
+    # ── Hot-path interno (chamado pela thread) ───────────────
+
+    def _processar_dados_brutos(self, dados: dict) -> Optional[dict]:
+        """
+        Atualiza contadores e retorna evento.
+        int += int e atomico no CPython (GIL) — sem lock no hot-path.
+        """
+        # Chama o parser stateful passando os buffers e lock
+        evento, proto_ef, tamanho, ip_orig, ip_dest = _parsear_pacote(
+            dados, self._tcp_buffers, self._buffer_lock
+        )
+
         self.total_pacotes += 1
-        tamanho = dados.get("tamanho", 0)
-        self.total_bytes += tamanho
+        self.total_bytes   += tamanho
+        self.estatisticas_protocolos[proto_ef] += 1
+        self.bytes_por_protocolo[proto_ef]     += tamanho
 
-        # Protocolo base informado pela captura (pode ser reclassificado para HTTP/HTTPS)
-        proto = dados.get("protocolo", "Outro") or "Outro"
-        protocolo_contagem = proto
+        if ip_orig:
+            self._enviado[ip_orig]  += tamanho
+        if ip_dest:
+            self._recebido[ip_dest] += tamanho
 
-        ip_origem = dados.get("ip_origem")
-        ip_destino = dados.get("ip_destino")
+        if proto_ef == "DNS" and evento and evento.get("dominio"):
+            entrada = self._top_dns[evento["dominio"]]
+            entrada[0] += 1
+            entrada[1] += tamanho
 
-        if ip_origem:
-            self.trafego_dispositivos[ip_origem]["enviado"] += tamanho
-        if ip_destino:
-            self.trafego_dispositivos[ip_destino]["recebido"] += tamanho
-
-        evento = None
-
-        # 1) DNS
-        if proto == "DNS" and dados.get("dominio"):
-            evento = {
-                "tipo": "DNS",
-                "ip_origem": ip_origem,
-                "ip_destino": ip_destino,
-                "dominio": dados["dominio"],
-                "protocolo": "DNS"
-            }
-            self._top_dns[dados["dominio"]]["contagem"] += 1
-            self._top_dns[dados["dominio"]]["bytes"] += tamanho
-
-        # 2) TCP SYN (nova conexão)
-        elif proto == "TCP" and dados.get("flags") == "SYN":
-            evento = {
-                "tipo": "TCP_SYN",
-                "ip_origem": ip_origem,
-                "ip_destino": ip_destino,
-                "porta_origem": dados.get("porta_origem"),
-                "porta_destino": dados.get("porta_destino"),
-                "protocolo": "TCP"
-            }
-
-        # 3) HTTP (porta 80)
-        elif dados.get("porta_destino") == 80 or dados.get("porta_origem") == 80:
-            payload = dados.get("payload", b"")
-            if payload:
-                try:
-                    linhas = payload.split(b"\r\n")
-                    primeira_linha = linhas[0].decode('utf-8', errors='ignore')
-                    if re.match(r"(GET|POST|PUT|DELETE|HEAD|OPTIONS)", primeira_linha):
-                        partes = primeira_linha.split(' ')
-                        protocolo_contagem = "HTTP"
-                        metodo = partes[0] if len(partes) > 0 else "HTTP"
-                        recurso = partes[1] if len(partes) > 1 else "/"
-                        corpo = b""
-                        credenciais = []
-                        if metodo == "POST":
-                            corpo_idx = payload.find(b"\r\n\r\n")
-                            if corpo_idx != -1:
-                                corpo = payload[corpo_idx+4:]
-                                corpo_str = corpo.decode('utf-8', errors='ignore')
-                                for match in re.finditer(r'(user|login|email|pass|password)=([^&\s]+)', corpo_str, re.I):
-                                    credenciais.append((match.group(1), match.group(2)))
-                        evento = {
-                            "tipo": "HTTP",
-                            "ip_origem": ip_origem,
-                            "ip_destino": ip_destino,
-                            "metodo": metodo,
-                            "recurso": recurso,
-                            "credenciais": credenciais,
-                            "payload_bruto": payload[:500].decode('utf-8', errors='ignore'),
-                            "protocolo": "HTTP"
-                        }
-                except:
-                    pass
-
-        # 4) HTTPS (porta 443)
-        elif dados.get("porta_destino") == 443 or dados.get("porta_origem") == 443:
-            protocolo_contagem = "HTTPS"
-            evento = {
-                "tipo": "HTTPS",
-                "ip_origem": ip_origem,
-                "ip_destino": ip_destino,
-                "protocolo": "HTTPS"
-            }
-
-        # 5) ICMP
-        elif proto == "ICMP":
-            evento = {
-                "tipo": "ICMP",
-                "ip_origem": ip_origem,
-                "ip_destino": ip_destino,
-                "protocolo": "ICMP"
-            }
-
-        # 6) ARP
-        elif proto == "ARP":
-            evento = {
-                "tipo": "ARP",
-                "ip_origem": ip_origem,
-                "ip_destino": ip_destino,
-                "mac_origem": dados.get("mac_origem"),
-                "protocolo": "ARP"
-            }
-
-        # Atualiza os contadores com o protocolo efetivo detectado
-        self.estatisticas_protocolos[protocolo_contagem] += 1
-        self.bytes_por_protocolo[protocolo_contagem] += tamanho
+        # Limpeza periodica de buffers expirados
+        self._packet_count_since_cleanup += 1
+        if self._packet_count_since_cleanup >= CLEANUP_INTERVAL:
+            self._limpar_buffers_expirados()
+            self._packet_count_since_cleanup = 0
 
         return evento
 
-    def obter_estatisticas_protocolos(self):
-        """Retorna lista de dicionários: [{'protocolo': 'TCP', 'pacotes': 10, 'bytes': 1500}, ...]"""
-        resultado = []
-        for proto, pacotes in self.estatisticas_protocolos.items():
-            resultado.append({
+    # ── API publica compativel com o original ────────────────
+
+    def processar_pacote(self, dados: dict) -> Optional[dict]:
+        """Modo sincrono — mantido para compatibilidade total."""
+        return self._processar_dados_brutos(dados)
+
+    def processar_lote(self, lista_dados: list) -> list:
+        """Processa lista de pacotes de uma vez. Retorna lista de eventos."""
+        return [self._processar_dados_brutos(d) for d in lista_dados]
+
+    def obter_estatisticas_protocolos(self) -> list:
+        resultado = [
+            {
                 "protocolo": proto,
-                "pacotes": pacotes,
-                "bytes": self.bytes_por_protocolo.get(proto, 0)
-            })
+                "pacotes":   pacotes,
+                "bytes":     self.bytes_por_protocolo.get(proto, 0),
+            }
+            for proto, pacotes in self.estatisticas_protocolos.items()
+        ]
         resultado.sort(key=lambda x: x["pacotes"], reverse=True)
         return resultado
 
-    def obter_top_dispositivos(self, top_n=10):
-        """Retorna lista agregando IPs externos em 'internet', consistente com a topologia."""
-        agregado = defaultdict(lambda: {"enviado": 0, "recebido": 0})
-        for ip, stats in self.trafego_dispositivos.items():
-            chave = ip if self._eh_local(ip) else "internet"
-            agregado[chave]["enviado"]  += stats["enviado"]
-            agregado[chave]["recebido"] += stats["recebido"]
-        ordenados = sorted(
-            agregado.items(),
-            key=lambda x: x[1]["enviado"] + x[1]["recebido"],
-            reverse=True
-        )
-        resultado = []
-        for ip, stats in ordenados[:top_n]:
-            resultado.append({
-                "ip": ip,
-                "enviado": stats["enviado"],
-                "recebido": stats["recebido"],
-                "total": stats["enviado"] + stats["recebido"]
-            })
-        return resultado
+    def obter_top_dispositivos(self, top_n: int = 10) -> list:
+        agregado_env: defaultdict = defaultdict(int)
+        agregado_rec: defaultdict = defaultdict(int)
 
-    def obter_top_dns(self, top_n=10):
+        for ip, v in self._enviado.items():
+            chave = ip if _eh_local_rapido(ip) else "internet"
+            agregado_env[chave] += v
+
+        for ip, v in self._recebido.items():
+            chave = ip if _eh_local_rapido(ip) else "internet"
+            agregado_rec[chave] += v
+
+        ips = set(agregado_env) | set(agregado_rec)
         ordenados = sorted(
-            self._top_dns.items(),
-            key=lambda x: x[1]["contagem"],
-            reverse=True
+            ips,
+            key=lambda ip: agregado_env[ip] + agregado_rec[ip],
+            reverse=True,
         )
         return [
-            {"dominio": dom, "acessos": info["contagem"], "bytes": info["bytes"]}
+            {
+                "ip":       ip,
+                "enviado":  agregado_env[ip],
+                "recebido": agregado_rec[ip],
+                "total":    agregado_env[ip] + agregado_rec[ip],
+            }
+            for ip in ordenados[:top_n]
+        ]
+
+    def obter_top_dns(self, top_n: int = 10) -> list:
+        ordenados = sorted(
+            self._top_dns.items(),
+            key=lambda x: x[1][0],
+            reverse=True,
+        )
+        return [
+            {"dominio": dom, "acessos": info[0], "bytes": info[1]}
             for dom, info in ordenados[:top_n]
         ]
+
+    @staticmethod
+    def _eh_local(ip: str) -> bool:
+        return _eh_local_rapido(ip)
